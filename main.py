@@ -1,16 +1,31 @@
-from fastapi import FastAPI, Path, Query, Body, status, HTTPException
+import anyio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Path, Query, Body, status, HTTPException, Depends, BackgroundTasks
+from sqlalchemy import select
+
+from db_connection import SessionFactory, get_session
+from models import User
 from schema import UserSignUpRequest, UserResponse, UserUpdateRequest
-from typing import List
-
-# 임시 데이터베이스
-users = [
-    {"id": 1, "name": "alex", "age": 20},
-    {"id": 2, "name": "bob", "age": 30},
-    {"id": 3, "name": "chris", "age": 40},
-]
 
 
-app =FastAPI()
+def send_email(name: str):
+    import time
+    time.sleep(5) # 5초 대기
+    print(f"{name}에게 이메일 전송이 완료되었습니다.")
+
+
+# 스레드 풀 개수
+@asynccontextmanager
+# lifespan -> FastAPI 서버가 실행되고 종료될 때, 특정 리소스를 생성하고 정리하는 기능
+async def lifespan(_):
+    # 서버 실행될 때, 실행되는 부분
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 200 # 스레들 풀 개수를 200개로 증량
+    yield
+    # 서버 종료될 때, 실행되는 부분
+
+app =FastAPI(lifespan=lifespan)
 
 # # 서버에 GET /hello 요청이 들어오면, hello_handler를 실행한다
 # @app.get("/hello")
@@ -24,16 +39,26 @@ app =FastAPI()
 @app.get(
         "/users",
         status_code=status.HTTP_200_OK,
-        response_model=List[UserResponse],
+        response_model=list[UserResponse],
 )
-def get_users_handlers():
+def get_users_handler(
+
+    # 요청이 시작 -> session이 생성
+    # 응답 반환 -> session.close()
+    session = Depends(get_session),
+):
+    # statment(구문) -> SELECT * FROM user
+    stmt = select(User)
+    result = session.execute(stmt)
+
+    # [user1, user2, ...]
+    users = result.scalars().all()
     return users
 
 # 회원 검색 API
 # HTTP Method: GET, POST, PUT, PATCH, DELETE
-# Query Parameter
-# ->  ?key=value 형태로 Path 뒤에 붙는 값
-# -> 데이터 조회시 부가 조건을 명시(필터링, 정렬, 검색 ,페이지네이션 등)
+# Query Parameter ->  ?key=value 형태로 Path 뒤에 붙는 값
+# 데이터 조회시 부가 조건을 명시(필터링, 정렬, 검색 ,페이지네이션 등)
 @app.get(
         "/users/search",
         status_code=status.HTTP_200_OK,
@@ -54,21 +79,25 @@ def search_user_handler(
 # GET/users/1?field=id -> id 반환
 # GET/users/1?field=name -> name 반환
 # GET/users/1 (없으면)-> id,name 반환
-@app.get("/users/{user_id}", response_model=UserResponse)
+@app.get(
+        "/users/{user_id}", 
+        status_code=status.HTTP_200_OK,
+        response_model=UserResponse,
+)
 def get_user_handler(
     user_id: int = Path(..., ge=1, description="사용자의 ID"),
-    field: str = Query(None, description="출력할 필드 선택(id 또는 name)"),
-) -> UserResponse:
-    if user_id > len(users):
+    session = Depends(get_session),
+):
+    
+    stmt = select(User).where(User.id == user_id)
+    result = session.execute(stmt)
+    user = result.scalar() # 1개의 데이터를 가져올 때
+
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="존재하지 않는 사용자의 ID입니다.",
         )
-    
-    user = users[user_id - 1]
-
-    if field in ("id", "name"):
-        return {field: user[field]}
     return user
 
 
@@ -92,7 +121,11 @@ def get_user_handler(
         # 3) API 문서에 예상되는 응답 출력
         response_model=UserResponse,
 )
-def sign_up_handler(body: UserSignUpRequest):
+def sign_up_handler(
+    body: UserSignUpRequest,
+    background_tasks: BackgroundTasks,  # BackgroundTasks 객체를 주입
+    session = Depends(get_session),
+):
     # 함수에 선언한 매개변수의 타입힌트가 BaseModel을 상속 받은 경우, 요청 본문에서 가져옴
     # 데이터 가져오면서, 타입힌트에 선언한 데이터 구조와 맞는지 검사
 
@@ -100,9 +133,15 @@ def sign_up_handler(body: UserSignUpRequest):
     # body 데이터가 문제 없으면 -> 핸들러 함수로 전달
     # body 데이터가 문제 있으면 -> 즉시  실행이 멈추고, 422 에러
     
-    new_user ={
-        "id": len(users) + 1, "name": body.name, "age": body.age}
-    users.append(new_user)
+    # SQLAlchemy ORM을 통해 새로운  user 인스턴스 생성
+    # id -> 데이터베이스가 관리하도록 위임
+    new_user = User(name=body.name, age=body.age)
+
+    session.add(new_user)
+    session.commit() # DB에 저장
+
+    # 이메일 전송 작업 BT(background_tasks)에 등록
+    background_tasks.add_task(send_email, body.name)
     return new_user
 
 
@@ -117,40 +156,62 @@ def sign_up_handler(body: UserSignUpRequest):
 def update_user_handler(
     user_id: int = Path(..., ge=1),
     body: UserUpdateRequest = Body(...),
-
+    session = Depends(get_session),
 ):
-    # Pseudo Code
-    # 1) user_id 검증
-    if user_id > len(users):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="존재하지 않는 사용자의 ID입니다.",
-        )
-    
-    # 1-b) body 데이터 검증
+
+    # 1) body 데이터 검증
     if body.name is None and body.age is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="수정할 데이터가 없습니다.",
         )
 
-    # 2) 사용자 조회 & 수정
-    user = users[user_id - 1]
+    # 2) 사용자 조회
 
-    # A) name만 수정하는경우 -> L#132
-    # B) age만 수정하는 경우 ->L#135
-    # C) name, age 모두 수정하는 경우 -> L#132, L#135
-    # D) name, age 모두 수정하지 않는 경우  -> 1-b처리
+    stmt = select(User).where(User.id == user_id)
+    result = session.execute(stmt)
+    user = result.scalar() 
 
-    if body.name is not None:
-        user["name"] = body.name
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="존재하지 않는 사용자의 ID입니다.",
+)
 
-    if body.age is not None:
-        user["age"] = body.age
+        if body.name is not None:
+            user.name = body.name
+
+        if body.age is not None:
+            user.age = body.age
+
+        session.commit()
 
     # 3) 응답 반환
     return user
 
+
+# 사용자 삭제(회원탈퇴) API
+@app.delete(
+        "/users/{user_id}",
+        status_code=status.HTTP_204_NO_CONTENT,  # 응답 본문 생성하지 않음
+)
+def delete_user_handler(
+    user_id: int = Path(..., ge=1),
+    session = Depends(get_session),
+):
+
+    stmt = select(User).where(User.id == user_id)
+    result = session.execute(stmt)
+    user = result.scalar()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="존재하지 않는 사용자의 ID입니다.",
+        )
+        
+    session.delete(user)
+    session.commit()
 
 
 
